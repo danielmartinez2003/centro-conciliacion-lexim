@@ -11,7 +11,13 @@ const _counters = new Map();
 function consulGet(path) {
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { hostname: CONSUL_HOST, port: CONSUL_PORT, path, method: 'GET' },
+      {
+        hostname: CONSUL_HOST,
+        port: CONSUL_PORT,
+        path,
+        method: 'GET',
+        rejectUnauthorized: false  // acepta certificado de Render
+      },
       (res) => {
         let raw = '';
         res.on('data', chunk => { raw += chunk; });
@@ -40,7 +46,9 @@ async function discoverService(serviceName) {
   if (cached && cached.expiresAt > now) {
     return pickRoundRobin(serviceName, cached.instances);
   }
-  const result = await consulGet(`/v1/health/service/${serviceName}?passing=true`);
+  const result = await consulGet(
+    `/v1/health/service/${serviceName}?passing=true`
+  );
   if (!Array.isArray(result) || result.length === 0) {
     throw new Error(`Sin instancias sanas para: ${serviceName}`);
   }
