@@ -1,74 +1,88 @@
-// ARCHIVO: Backend/Gateway/src/utils/consulDiscovery.js
+// ARCHIVO: src/utils/consulRegister.js
+// Igual para todos los microservicios
 'use strict';
 const https = require('https');
 
 const CONSUL_HOST = process.env.CONSUL_HOST || 'consul-lexim.onrender.com';
 const CONSUL_PORT = parseInt(process.env.CONSUL_PORT || '443', 10);
-const CACHE_TTL   = 10_000;
-const _cache    = new Map();
-const _counters = new Map();
+const SERVICE_NAME = process.env.SERVICE_NAME;
+const SERVICE_PORT = parseInt(process.env.SERVICE_PORT || '3001', 10);
 
-function consulGet(path) {
+function consulRequest(method, path, body) {
   return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
     const req = https.request(
       {
         hostname: CONSUL_HOST,
         port: CONSUL_PORT,
         path,
-        method: 'GET',
-        rejectUnauthorized: false  // acepta certificado de Render
+        method,
+        rejectUnauthorized: false,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(data && { 'Content-Length': Buffer.byteLength(data) })
+        }
       },
       (res) => {
-        let raw = '';
-        res.on('data', chunk => { raw += chunk; });
-        res.on('end', () => {
-          try { resolve(JSON.parse(raw)); }
-          catch { reject(new Error(`Consul parse error: ${raw.slice(0, 100)}`)); }
-        });
+        let out = '';
+        res.on('data', c => out += c);
+        res.on('end', () => resolve({ status: res.statusCode, body: out }));
       }
     );
     req.on('error', reject);
     req.setTimeout(5000, () => req.destroy(new Error('Consul timeout')));
+    if (data) req.write(data);
     req.end();
   });
 }
 
-function pickRoundRobin(serviceName, instances) {
-  const idx  = (_counters.get(serviceName) || 0) % instances.length;
-  _counters.set(serviceName, idx + 1);
-  const inst = instances[idx];
-  return `http://${inst.address}:${inst.port}`;
-}
-
-async function discoverService(serviceName) {
-  const now    = Date.now();
-  const cached = _cache.get(serviceName);
-  if (cached && cached.expiresAt > now) {
-    return pickRoundRobin(serviceName, cached.instances);
+async function registerService() {
+  if (!SERVICE_NAME || !SERVICE_PORT) {
+    console.warn('[Consul] SERVICE_NAME o SERVICE_PORT no definidos');
+    return;
   }
-  const result = await consulGet(
-    `/v1/health/service/${serviceName}?passing=true`
-  );
-  if (!Array.isArray(result) || result.length === 0) {
-    throw new Error(`Sin instancias sanas para: ${serviceName}`);
-  }
-  const instances = result.map(e => ({
-    address: e.Service.Address || e.Node.Address,
-    port:    e.Service.Port
-  }));
-  _cache.set(serviceName, { instances, expiresAt: now + CACHE_TTL });
-  return pickRoundRobin(serviceName, instances);
-}
 
-async function resolveService(serviceName, fallbackUrl) {
+  const payload = {
+    ID: `${SERVICE_NAME}-${SERVICE_PORT}`,
+    Name: SERVICE_NAME,
+    Address: SERVICE_NAME,
+    Port: SERVICE_PORT,
+    Tags: ['lexim', 'microservice'],
+    Check: {
+      HTTP: `http://${SERVICE_NAME}:${SERVICE_PORT}/health`,
+      Interval: '15s',
+      Timeout: '5s',
+      DeregisterCriticalServiceAfter: '30s'
+    }
+  };
+
   try {
-    const url = await discoverService(serviceName);
-    console.log(`[Consul] ${serviceName} -> ${url}`);
-    return url;
+    const { status } = await consulRequest(
+      'PUT',
+      '/v1/agent/service/register',
+      payload
+    );
+    if (status === 200) {
+      console.log(`[Consul] ${SERVICE_NAME}:${SERVICE_PORT} registrado exitosamente`);
+    } else {
+      console.error(`[Consul] Registro fallido — HTTP ${status}`);
+    }
   } catch (err) {
-    console.warn(`[Consul] Fallback -> ${fallbackUrl} (${err.message})`);
-    return fallbackUrl;
+    console.error(`[Consul] No se pudo conectar: ${err.message}`);
   }
 }
 
-module.exports = { resolveService };
+async function deregisterService() {
+  if (!SERVICE_NAME) return;
+  try {
+    await consulRequest(
+      'PUT',
+      `/v1/agent/service/deregister/${SERVICE_NAME}-${SERVICE_PORT}`
+    );
+    console.log(`[Consul] ${SERVICE_NAME} desregistrado`);
+  } catch (err) {
+    console.error(`[Consul] Error al desregistrar: ${err.message}`);
+  }
+}
+
+module.exports = { registerService, deregisterService };
